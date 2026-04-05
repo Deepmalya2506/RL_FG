@@ -1,0 +1,4 @@
+flightgear-python
+pandas 
+numpy
+logging
