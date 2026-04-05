@@ -7,90 +7,135 @@ from flightgear_python.fg_if import FDMConnection
 # --- LOGGER SETUP ---
 logger = logging.getLogger("FlightDynamicsLogger")
 logger.setLevel(logging.INFO)
-# Rotating log file: max 5MB, keep 5 backups
-handler = RotatingFileHandler("flight_log.log", maxBytes=5*1024*1024, backupCount=5)
-formatter = logging.Formatter('%(asctime)s | %(message)s')
+handler = RotatingFileHandler("flight_log_full.log", maxBytes=5*1024*1024, backupCount=5)
+formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # --- SIMULATION CONSTANTS ---
-ACCEL_K = 2.5        # Uniform acceleration (m/s^2) - selected for a smooth 10s roll
+ACCEL_K = 2.5            # m/s^2
+TARGET_ALT_M = 300.0     # ~1000 feet
+CLIMB_PITCH_DEG = 10.0   # Pitch during climb
+PHASE_1_DURATION = 10.0  # Ground roll time
+ROTATION_DURATION = 4.0  # Time to lift nose
+LEVEL_OFF_DURATION = 6.0 # Time to transition to level flight
+
 EARTH_RADIUS = 6378137.0 
-FPS = 30
-DT = 1.0 / FPS
+DT = 1.0 / 30.0          # Fixed Delta Time for physics stability
 
 class AircraftState:
     def __init__(self):
         self.velocity_mps = 0.0
-        self.distance_m = 0.0
+        self.alt_m = 0.0
+        self.pitch_rad = 0.0
+        self.lat_rad = None
+        self.lon_rad = None
+        self.heading_rad = None
         self.start_time = None
-        self.initial_lat = None
-        self.initial_lon = None
-        self.heading_rad = None  # To capture the runway heading
+        self.current_phase = "GROUND_ROLL"
 
 state = AircraftState()
 
 def fdm_callback(fdm_data, event_pipe):
     curr_time = time.time()
     
-    # Initialization on first packet
+    # 1. INITIALIZATION (Frame 0)
     if state.start_time is None:
         state.start_time = curr_time
-        state.initial_lat = fdm_data['lat_rad']
-        state.initial_lon = fdm_data['lon_rad']
-        # Capture the direction the plane is facing so we move "Forward"
-        state.heading_rad = fdm_data['psi_rad'] 
-        logger.info(f"Simulation Started. Heading: {math.degrees(state.heading_rad):.2f} degrees")
+        state.lat_rad = fdm_data['lat_rad']
+        state.lon_rad = fdm_data['lon_rad']
+        state.heading_rad = fdm_data['psi_rad'] # LOCK HEADING
+        state.alt_m = fdm_data['alt_m']
+        logger.info(f"STARTING: Phase 1 (Ground Roll) at Heading {math.degrees(state.heading_rad):.1f}°")
 
     elapsed = curr_time - state.start_time
 
-    # 1. Uniform Acceleration Logic (for 10 seconds)
-    if elapsed <= 10.0:
+    # 2. STATE MACHINE & PHASE LOGIC
+    # PHASE 1: Ground Roll
+    if elapsed < PHASE_1_DURATION:
+        state.current_phase = "GROUND_ROLL"
         state.velocity_mps += ACCEL_K * DT
-        state.distance_m += state.velocity_mps * DT
-    else:
-        # Stop accelerating after 10s, maintain speed
-        pass
+        state.pitch_rad = 0.0
 
-    # 2. Update Position based on Heading (Trigonometry)
-    # delta_lat = distance * cos(heading)
-    # delta_lon = distance * sin(heading) / cos(lat)
-    lat_change = (state.distance_m * math.cos(state.heading_rad)) / EARTH_RADIUS
-    lon_change = (state.distance_m * math.sin(state.heading_rad)) / (EARTH_RADIUS * math.cos(state.initial_lat))
+    # PHASE 2: Rotation & Climb
+    elif state.alt_m < TARGET_ALT_M:
+        if state.current_phase == "GROUND_ROLL":
+            logger.info("TRANSITION: Phase 2 (Rotation/Climb)")
+        state.current_phase = "CLIMB"
+        
+        state.velocity_mps += (ACCEL_K * 0.5) * DT # Reduced accel during climb
+        
+        # Smoothly increase pitch to CLIMB_PITCH_DEG
+        rotation_elapsed = elapsed - PHASE_1_DURATION
+        target_pitch = math.radians(CLIMB_PITCH_DEG)
+        if rotation_elapsed < ROTATION_DURATION:
+            # Linear interpolation for smooth nose lift
+            state.pitch_rad = (rotation_elapsed / ROTATION_DURATION) * target_pitch
+        else:
+            state.pitch_rad = target_pitch
+
+    # PHASE 3: Level Off
+    else:
+        if state.current_phase == "CLIMB":
+            logger.info("TRANSITION: Phase 3 (Leveling Off)")
+            state.level_start_time = elapsed
+        state.current_phase = "LEVEL_FLIGHT"
+        
+        # Maintain velocity, smoothly return pitch to 0.0 (Cruise)
+        level_elapsed = elapsed - state.level_start_time
+        start_pitch = math.radians(CLIMB_PITCH_DEG)
+        if level_elapsed < LEVEL_OFF_DURATION:
+            state.pitch_rad = start_pitch * (1 - (level_elapsed / LEVEL_OFF_DURATION))
+        else:
+            state.pitch_rad = 0.0
+        
+        # Lock altitude strictly once leveled
+        state.alt_m = TARGET_ALT_M
+
+    # 3. INCREMENTAL PHYSICS INTEGRATION (The "Jitter Fix")
+    v_vertical = state.velocity_mps * math.sin(state.pitch_rad)
+    v_horizontal = state.velocity_mps * math.cos(state.pitch_rad)
+
+    # Calculate distance moved in this specific 1/30th of a second
+    dist_this_frame = v_horizontal * DT
     
-    # 3. Apply updates to the FDM structure
-    fdm_data['lat_rad'] = state.initial_lat + lat_change
-    fdm_data['lon_rad'] = state.initial_lon + lon_change
+    # Update Latitude/Longitude incrementally
+    state.lat_rad += (dist_this_frame * math.cos(state.heading_rad)) / EARTH_RADIUS
+    state.lon_rad += (dist_this_frame * math.sin(state.heading_rad)) / (EARTH_RADIUS * math.cos(state.lat_rad))
     
-    # Set velocities for the cockpit instruments (v_body_u is forward speed)
-    fdm_data['v_body_u'] = state.velocity_mps * 3.28084  # m/s to ft/s
-    fdm_data['vcas'] = state.velocity_mps * 1.94384      # m/s to knots
+    # Update Altitude (only if not finished leveling off)
+    if state.current_phase != "LEVEL_FLIGHT" or state.pitch_rad > 0:
+        state.alt_m += v_vertical * DT
+
+    # 4. UPDATE FDM OBJECT
+    fdm_data['lat_rad'] = state.lat_rad
+    fdm_data['lon_rad'] = state.lon_rad
+    fdm_data['alt_m'] = state.alt_m
+    fdm_data['theta_rad'] = state.pitch_rad
+    fdm_data['psi_rad'] = state.heading_rad  # FORCE HEADING LOCK
+    fdm_data['phi_rad'] = 0.0               # FORCE WINGS LEVEL
     
-    # Lock attitude for a steady runway roll
-    fdm_data['phi_rad'] = 0.0    # No roll
-    fdm_data['theta_rad'] = 0.0  # No pitch
-    fdm_data['agl_m'] = 0.0      # Stay on ground
-    
-    # 4. Logging
-    # Dictionary comprehension to grab all parameters for the log
-    log_dict = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in fdm_data.items()}
-    logger.info(f"T+{elapsed:.2f}s | Vel: {state.velocity_mps:.1f}m/s | Data: {log_dict}")
+    # Airspeed and Climb Rate for cockpit
+    fdm_data['v_body_u'] = state.velocity_mps * 3.28084
+    fdm_data['vcas'] = state.velocity_mps * 1.94384
+    fdm_data['climb_rate_ft_per_s'] = v_vertical * 3.28084
+
+    # 5. DATA LOGGING
+    logger.info(f"[{state.current_phase}] Time:{elapsed:.2f}s | Alt:{state.alt_m:.1f}m | Pitch:{math.degrees(state.pitch_rad):.1f}° | Spd:{fdm_data['vcas']:.1f}kt")
 
     return fdm_data
 
 if __name__ == '__main__':
     fdm_conn = FDMConnection()
-    
-    # Using the standard ports for FlightGear Native FDM
     fdm_conn.connect_rx('localhost', 5501, fdm_callback)
     fdm_conn.connect_tx('localhost', 5502)
 
-    print(f"Running smooth runway roll at {ACCEL_K} m/s^2. Check flight_log.log for data.")
+    print("System Online. Executing Flight Plan: Roll -> Rotate -> Level.")
     fdm_conn.start()
 
     try:
         while True:
-            time.sleep(0.1)
+            time.sleep(1)
     except KeyboardInterrupt:
         fdm_conn.stop()
-        print("\nSimulation Ended.")
+        print("\nFlight Logged and Connection Closed.")
