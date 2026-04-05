@@ -34,7 +34,7 @@ def fdm_callback(fdm_data, event_pipe):
     
     # Initialize start position and time on first packet
     if state.start_time is None:
-        state.start_time = curr_time
+        state.start_time = curr_time 
         state.initial_lat = fdm_data['lat_rad']
         state.initial_lon = fdm_data['lon_rad']
         logger.info("Simulation Started - Initial Position Logged")
